@@ -1,0 +1,716 @@
+import CaseType.*
+import Item.*
+import sun.invoke.empty.Empty
+import java.util.*
+
+
+fun debug(value: Any?) = System.err.println(value)
+
+val INITIAL_POSITION = Point(-1, -1)
+
+data class Point(val x: Int, val y: Int) {
+    fun distanceTo(other: Point) = Math.abs(this.x - other.x) + Math.abs(this.y - other.y)
+    fun isAdjacent(point: Point) = Math.abs(this.x - point.x) <= 1 && Math.abs(this.y - point.y) <= 1
+
+    val left get() = Point(this.x - 1, this.y)
+    val right get() = Point(this.x + 1, this.y)
+    val up get() = Point(this.x, this.y + 1)
+    val down get() = Point(this.x, this.y - 1)
+}
+
+
+/**
+ *
+ * PLAYER/ITEM
+ *
+ */
+open class Player(var position: Point = INITIAL_POSITION, var items: List<Item> = listOf(), var currentTable: Table? = null) {
+    open fun update(input: Scanner) {
+        this.position = Point(input.nextInt(), input.nextInt())
+        this.items = input.readItems()
+    }
+}
+
+enum class Item(val complexity: Int, val preparation: List<Item>? = null, val caseProvider: CaseType? = null) {
+    DISH(1, null, DISHWASHER),
+    BLUEBERRIES(1, null, BLUEBERRIES_CRATE),
+    ICE_CREAM(1, null, ICE_CREAMER),
+    STRAWBERRIES(1, null, STRAWBERRIES_CRATE),
+    DOUGH(1, null, DOUGH_CRATE),
+    CHOPPED_STRAWBERRIES(2, listOf(STRAWBERRIES)),
+    CROISSANT(3, listOf(DOUGH)),
+    CHOPPED_DOUGH(2, listOf(DOUGH)),
+    RAW_TART(3, listOf(CHOPPED_DOUGH, BLUEBERRIES)),
+    TART(5, listOf(RAW_TART));
+
+    fun getAllConcernedIngredient(): List<Item> {
+        if (preparation == null) {
+            return listOf()
+        } else {
+            return preparation + preparation.map { it.getAllConcernedIngredient() }.flatten()
+        }
+    }
+}
+
+
+enum class StartPoint(private val expectedResult: Item, private val start: Item) {
+    START_TART(TART, DOUGH),
+    START_CROISSANT(CROISSANT, DOUGH),
+    START_CHOPPED_STRAW(CHOPPED_STRAWBERRIES, STRAWBERRIES);
+
+    companion object {
+        fun getStart(item: Item): Item = values().find { it.expectedResult == item }?.start ?: error("Cannot start a preparation for the item $item")
+    }
+}
+
+enum class Actions(private val currentItem: Item, val caseTypes: List<Pair<CaseType, Item>>? = null, val items: List<Pair<Item, Item>>? = null) {
+    //ACTION_DISH(DISH, null, null), //No man, we don't manage DISH here
+    ACTION_DOUGH(DOUGH, listOf(CHOPPING_BOARD to TART, OVEN to CROISSANT), null),
+    ACTION_BLUEBERRIES(BLUEBERRIES, null, listOf(CHOPPED_DOUGH to TART, RAW_TART to TART)),
+    ACTION_STRAWBERRIES(STRAWBERRIES, listOf(CHOPPING_BOARD to CHOPPED_STRAWBERRIES), null),
+    ACTION_CHOPPED_DOUGH(CHOPPED_DOUGH, null, listOf(BLUEBERRIES to TART)),
+    ACTION_RAW_TART(RAW_TART, listOf(OVEN to TART), null);
+
+    companion object {
+        fun getActions(item: Item) = values().find { it.currentItem == item }
+    }
+}
+
+
+data class Customer(val recipe: List<Item>, val award: Int) {
+    fun getAwardOnComplexity() = award.toDouble() / recipe.sumBy { it.complexity }.toDouble()
+}
+
+
+/**
+ *
+ * WORLD/MAP
+ *
+ */
+data class Table(val case: Case, val items: List<Item>)
+
+enum class CaseType(val caseChar: Char) {
+    BLUEBERRIES_CRATE('B'),
+    STRAWBERRIES_CRATE('S'),
+    ICE_CREAMER('I'),
+    DOUGH_CRATE('H'),
+    DISHWASHER('D'),
+    CHOPPING_BOARD('C'),
+    WORK_TABLE('#'),
+    OVEN('O'),
+    CUSTOMER_BELL('W'),
+    EMPTY('.')
+}
+
+fun fromChar(char: Char) = CaseType.values().firstOrNull { it.caseChar == char } ?: EMPTY//error("what the char $char")
+
+data class Case(val position: Point, val type: CaseType)
+data class Game(
+    val map: List<List<Case>>,
+    val customers: List<Customer>,
+    var partner: Partner = Partner(),
+    var waitingCustomers: List<Customer> = listOf(),
+    private var tables: List<Table> = listOf(),
+    var tableItemsAvailables: Map<Item, List<Table>> = hashMapOf(),
+    private val casesFlatten: List<Case> = map.flatten(),
+    val usefulCases: Map<CaseType, Case> = (CaseType.values().toList() - EMPTY).associate { it to findCase(casesFlatten, it) },
+    var ovenContents: List<Item> = listOf(),
+    var ovenTimer: Int = 0
+) {
+    companion object {
+        private fun findCase(casesFlatten: List<Case>, caseType: CaseType) = casesFlatten.first { it.type == caseType }
+    }
+
+    fun get(x: Int, y: Int) = map[y][x]
+    fun get(point: Point) = get(point.x, point.y)
+    fun getEmptyTable(player: Player) = (-1..1).flatMap { y -> (-1..1).map { x -> this.get(player.position.x + x, player.position.y + y) } }
+        .filter { it.type == WORK_TABLE }
+        .firstOrNull { case -> tables.none { it.case.position == case.position } }
+
+    fun getRandomCase() = this.get(this.partner.position)
+
+    fun getNearerItemOnTable(player: Player, item: Item) = this.tableItemsAvailables[item]?.minBy { it.case.position.distanceTo(player.position) }
+
+
+    fun update(input: Scanner) {
+        this.tables = (0 until input.nextInt()).map { Table(Case(Point(input.nextInt(), input.nextInt()), WORK_TABLE), input.readItems()) }
+        this.tableItemsAvailables = this.tables.filter { table -> table.items.size == 1 && table.items.first().preparation != null }.groupBy { it.items.first() }
+        /*tableItemsAvailables.forEach { pair ->
+            pair.value.forEach { debug("${pair.key} on the table $it") }
+        }*/
+
+        this.ovenContents = input.readItems()
+        this.ovenTimer = input.nextInt()
+
+        this.waitingCustomers = (0 until input.nextInt()).map {
+            val items = input.readItems().reversed()
+            Customer(items, input.nextInt())
+        }
+    }
+
+    val dishwasher get() = usefulCases.getValue(DISHWASHER)
+    val blueberriesCrate get() = usefulCases.getValue(BLUEBERRIES_CRATE)
+    val strawberriesCrate get() = usefulCases.getValue(STRAWBERRIES_CRATE)
+    val doughCrate get() = usefulCases.getValue(DOUGH_CRATE)
+    val choppingBoard get() = usefulCases.getValue(CHOPPING_BOARD)
+    val iceCreamer get() = usefulCases.getValue(ICE_CREAMER)
+    val oven get() = usefulCases.getValue(OVEN)
+    val customerBell get() = usefulCases.getValue(CUSTOMER_BELL)
+}
+
+fun Scanner.readItems(): List<Item> {
+    val line = this.next()
+
+    if (line == "NONE") {
+        return listOf()
+    } else {
+        return line.split("-").map { Item.valueOf(it) }.sortedBy { it.name }
+    }
+}
+
+/**
+ *
+ * GAME LOGIC
+ *
+ */
+fun Player.move(destination: Point) = println("MOVE ${destination.x} ${destination.y}")
+
+fun Player.move(case: Case) = this.move(case.position)
+fun Player.use(destination: Point) = println("USE ${destination.x} ${destination.y}")
+fun Player.use(case: Case) = if (case.type == EMPTY) move(case) else this.use(case.position)
+fun Player.wait() = println("WAIT")
+
+
+fun Player.collectAllItems(game: Game, items: List<Item>): Case {
+    val missingItems = items.filter { !this.items.contains(it) }
+
+    return missingItems.map { item ->
+        when (item) {
+            BLUEBERRIES -> game.blueberriesCrate
+            ICE_CREAM -> game.iceCreamer
+            STRAWBERRIES -> game.strawberriesCrate
+            CROISSANT -> game.getNearerItemOnTable(this, CROISSANT)?.case ?: error("I cannot find the CROISSANT anymore")
+            TART -> game.getNearerItemOnTable(this, TART)?.case ?: error("I cannot find the TART anymore")
+            CHOPPED_STRAWBERRIES -> game.getNearerItemOnTable(this, CHOPPED_STRAWBERRIES)?.case ?: error("I cannot find the CHOPPED_STRAWBERRIES anymore")
+            else -> error("What's that item that I have to collect? $item")
+        }
+    }.minBy { it.position.distanceTo(this.position) } ?: error("There is no item to collect, something is wrong...")
+}
+
+fun Player.prepareDish(game: Game, customer: Customer): Case {
+    if (this.items.isEmpty()) {
+        debug("I need a dish")
+        return game.dishwasher
+    } else if (!this.items.contains(DISH)) {
+        debug("I have an item, i drop it to take a dish")
+        return game.getEmptyTable(this) ?: game.getRandomCase()
+    } else {
+        debug("I collect all items")
+        return collectAllItems(game, customer.recipe)
+    }
+}
+
+fun Player.haveAllItems(game: Game, items: List<Item>): Boolean {
+    return items.all { this.items.contains(it) }
+}
+
+
+fun Player.dropPreparedItem(game: Game): Case {
+    /*if (this.items.first().preparation == null) { //pure security
+        error("This is not a prepared item! ${this.items.first()}")
+    }*/
+    return game.getEmptyTable(this) ?: game.getRandomCase()
+}
+
+
+fun Player.howMuchCustomerCanTake(game: Game): List<Customer> {
+    val itemsOnTable = (game.tableItemsAvailables.flatMap { it.value }.flatMap { it.items } + this.items /*+ game.partner.items*/).toMutableList()
+    var customerReady = mutableListOf<Customer>()
+
+    game.waitingCustomers.sortedByDescending { it.getAwardOnComplexity() }.forEach { customer ->
+        customer.recipe.filter { it.preparation != null }.forEach {
+            if (itemsOnTable.contains(it)) {
+                itemsOnTable.remove(it)
+            } else {
+                return customerReady
+            }
+        }
+        customerReady.add(customer)
+    }
+
+    return customerReady
+}
+
+fun Case.distanceTo(player: Player) = this.position.distanceTo(player.position)
+fun Table.distanceTo(player: Player) = this.case.position.distanceTo(player.position)
+
+
+fun Player.reuseAvailableItems(game: Game, itemsToPrepare: List<Item>): Case? {
+    val rawTartCase = game.tableItemsAvailables[RAW_TART]?.minBy { it.distanceTo(this) }
+    if (rawTartCase != null && itemsToPrepare.contains(TART)) {
+        return rawTartCase.case
+    }
+    val choppedDoughCase = game.tableItemsAvailables[CHOPPED_DOUGH]?.minBy { it.distanceTo(this) }
+    if (choppedDoughCase != null && itemsToPrepare.contains(TART)) {
+        return choppedDoughCase.case
+    }
+
+    return null
+}
+
+fun Player.prepareItemsForFun(game: Game) {
+    val currentItem = this.items.firstOrNull()
+    val case: Case //The decision
+
+    val allItemsToPrepare = game.waitingCustomers.flatMap { it.recipe }.filter { it.preparation != null }.groupBy { it }.map { it.key to it.value.size }.toMap()
+    //val allItemsToPrepare = game.waitingCustomers.maxBy { it.getAwardOnComplexity() }?.recipe?.filter { it.preparation != null }?.groupBy { it }?.map { it.key to it.value.size }?.toMap() ?: error("You cannot find any customer, huh?")
+    debug("best award/complexity: ${game.waitingCustomers.maxBy { it.getAwardOnComplexity() }?.recipe}")
+
+    val myItems = this.items.groupBy { it }
+    val partnerItems = game.partner.items.groupBy { it }
+
+    val itemsRemainingToPrepare = allItemsToPrepare.map {
+        it.key to it.value - (game.tableItemsAvailables[it.key]?.size ?: 0) - (myItems[it.key]?.size ?: 0) - (partnerItems[it.key]?.size ?: 0)
+        it.key to it.value - (game.tableItemsAvailables[it.key]?.size ?: 0) - (myItems[it.key]?.size ?: 0)
+    }.filter { it.second > 0 }.toMap()
+
+    itemsRemainingToPrepare.forEach { debug("To prepare: [${it.key}] -> ${it.value}") }
+
+    val customersReady = howMuchCustomerCanTake(game)
+    customersReady.forEach { debug("Customer ready to collect: ${it.getAwardOnComplexity()} -> ${it.recipe}") }
+
+    if (customersReady.isNotEmpty() && (this.items.contains(DISH) || customersReady.size > 1 || (game.partner.items.contains(DISH) && this.position.distanceTo(game.dishwasher.position) <= game.partner.position.distanceTo(game.dishwasher.position)))) {
+        debug("collect items in a dish")
+        /*val partnerCustomer = game.partner.getCurrentCustomer(game)
+        val availableCustomers = if (partnerCustomer == null) customersReady else (customersReady - partnerCustomer)
+        val customer = availableCustomers.maxBy { it.award }!!*/
+        val customer = customersReady.maxBy { it.award } ?: error("Impossible to not have a customer (because isNotEmpty)")
+
+        debug("The dish recipe: ${customer.recipe}")
+        if (haveAllItems(game, customer.recipe)) {
+            debug("I have everything, go to the bell")
+            case = game.customerBell
+        } else {
+            debug("I prepare the dish")
+            case = prepareDish(game, customer)
+        }
+    } else if (currentItem == null && game.ovenContents.isNotEmpty()) {
+        debug("wait for oven")
+        case = game.oven
+    } else if (currentItem == null) {
+        val reusedPreparation = reuseAvailableItems(game, itemsRemainingToPrepare.map { it.key })
+        if (reusedPreparation != null) {
+            debug("I reuse an mid-preparation item")
+            case = reusedPreparation
+        } else {
+            debug("start a preparation")
+            case = itemsRemainingToPrepare
+                .map { it to game.usefulCases.getValue(StartPoint.getStart(it.key).caseProvider!!) }
+                .sortedBy { it.second.position.distanceTo(this.position) / it.first.value }
+                .first().second
+        }
+    } else if (game.waitingCustomers.any { haveAllItems(game, it.recipe) }) {
+        debug("go to the customer bell")
+        case = game.customerBell
+    } else if (this.items.contains(DISH)) {
+        debug("I need to wash my dish")
+        //TODO deposit and get it back later if it can be useful, else go to dishwasher
+        case = game.dishwasher
+    } else {
+        val action = Actions.getActions(currentItem)
+
+        if (action == null) {
+            debug("the preparation is ready, drop it somewhere")
+            case = dropPreparedItem(game)
+        } else {
+            debug("continue a preparation, my action is $action")
+            val actionCases = action.caseTypes
+                ?.filter { itemsRemainingToPrepare.contains(it.second) }
+                ?.map { game.usefulCases.getValue(it.first) }
+                ?: listOf()
+
+            val actionItemCases = action.items
+                ?.filter { itemsRemainingToPrepare.contains(it.second) }
+                ?.map { game.getNearerItemOnTable(this, it.first)?.case ?: game.usefulCases.getValue(it.first.caseProvider!!) }
+                ?: listOf()
+
+            val result = (actionCases + actionItemCases).minBy { it.position.distanceTo(this.position) }
+            case = if (result == null) game.getEmptyTable(this) ?: game.getRandomCase() else result
+        }
+    }
+
+    use(case)
+}
+
+
+fun Player.nearToOvenAndWillBurn(game: Game): Boolean {
+    return game.oven.position.distanceTo(this.position) <= 2 && game.ovenTimer < 4 && listOf(TART, CROISSANT).any { game.ovenContents.contains(it) }
+}
+
+fun Player.saveOvenContent(game: Game) {
+    if (this.items.isNotEmpty()) {
+        debug("I drop my item, I need to save the oven content")
+        use(dropPreparedItem(game))
+    } else {
+        debug("I save the oven content")
+        use(game.oven)
+    }
+}
+
+
+/**
+ *
+ *
+ * PARTNER UNDERSTANDING
+ *
+ *
+ */
+class Partner(private val itemsUsed: MutableSet<Item> = mutableSetOf()) : Player() {
+    override fun update(input: Scanner) {
+        super.update(input)
+
+        if (this.items.isNotEmpty()) {
+            this.itemsUsed.addAll(items)
+        }
+    }
+
+    fun getCurrentCustomer(game: Game): Customer? {
+        var itemsByCustomer = game.waitingCustomers.map { it to it.recipe.flatMap { item -> item.getAllConcernedIngredient() + item } }
+
+        for (item in this.itemsUsed.minus(DISH)) {
+            val newList = itemsByCustomer.filter { it.second.contains(item) }
+            if (newList.size == 1) {
+                return newList.first().first
+            }
+            itemsByCustomer = newList
+        }
+
+        if (itemsByCustomer.size == 2) {
+            debug("Not sure of the partner customer, I consider the best award")
+            return itemsByCustomer.maxBy { it.first.award }?.first
+        }
+
+        debug("Couldn't find the partner targeted customer, ${itemsByCustomer.size} corresponding")
+        debug(itemsUsed)
+        return null
+    }
+
+    fun ringCustomerBell() = this.itemsUsed.clear()
+}
+
+
+fun main2(args: Array<String>) {
+    val input = Scanner(System.`in`)
+
+    val customers = (0 until input.nextInt()).map {
+        val items = input.readItems()
+        Customer(items, input.nextInt())
+    }
+
+    input.nextLine() //why?
+
+    val cases = (0 until 7).map { y ->
+        val kitchenLine = input.nextLine()
+        debug(kitchenLine)
+        kitchenLine.mapIndexed { x, char -> Case(Point(x, y), fromChar(char)) }
+    }
+    val game = Game(cases, customers)
+    val player = Player()
+    val partner = Partner()
+    game.partner = partner
+
+    var previousCustomer: List<Customer> = game.waitingCustomers
+
+    // game loop
+    while (true) {
+        val turnsRemaining = input.nextInt()
+        player.update(input)
+        partner.update(input)
+        debug("partner chosen customer is: ${partner.getCurrentCustomer(game)}")
+        game.update(input)
+
+        if (!(0 until previousCustomer.size).all { i -> previousCustomer[i].award == game.waitingCustomers[i].award + 2 }) {
+            partner.ringCustomerBell()
+            debug("Partner served a dish!")
+        }
+
+        if (game.waitingCustomers.isNotEmpty()) {
+            if (player.nearToOvenAndWillBurn(game)) {
+                player.saveOvenContent(game)
+            } else {
+                player.prepareItemsForFun(game)
+                //player.completeCustomerOrder(game, game.waitingCustomers.maxBy { it.award }!!.recipe)
+            }
+        } else
+            player.wait()
+
+        previousCustomer = game.waitingCustomers
+    }
+}
+
+
+fun main(args: Array<String>) {
+
+    val map = listOf(
+        listOf(WORK_TABLE, WORK_TABLE, WORK_TABLE, WORK_TABLE, WORK_TABLE, DISHWASHER, WORK_TABLE, WORK_TABLE, WORK_TABLE, WORK_TABLE, WORK_TABLE),
+        listOf(STRAWBERRIES_CRATE, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, WORK_TABLE),
+        listOf(WORK_TABLE, EMPTY, WORK_TABLE, WORK_TABLE, WORK_TABLE, WORK_TABLE, EMPTY, WORK_TABLE, WORK_TABLE, EMPTY, WORK_TABLE),
+        listOf(OVEN, EMPTY, WORK_TABLE, EMPTY, EMPTY, WORK_TABLE, EMPTY, EMPTY, DOUGH_CRATE, EMPTY, ICE_CREAMER),
+        listOf(CHOPPING_BOARD, EMPTY, WORK_TABLE, WORK_TABLE, EMPTY, WORK_TABLE, WORK_TABLE, WORK_TABLE, WORK_TABLE, EMPTY, BLUEBERRIES_CRATE),
+        listOf(WORK_TABLE, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, WORK_TABLE),
+        listOf(WORK_TABLE, WORK_TABLE, WORK_TABLE, WORK_TABLE, WORK_TABLE, CUSTOMER_BELL, WORK_TABLE, WORK_TABLE, WORK_TABLE, WORK_TABLE, WORK_TABLE)
+    ).mapIndexed { y, row -> row.mapIndexed { x, caseType -> Case(Point(x, y), caseType) } }
+
+    val player = Simulator.Player(Point(1, 1))
+    val partner = Simulator.Player()
+    val game = Simulator.Game(map, player, partner)
+
+    val items = listOf(DISH, BLUEBERRIES, ICE_CREAM)
+
+    game.debug()
+    /*
+    Simulator.move(game, player, game.usefulCases.getValue(CUSTOMER_BELL))
+    debug("move1 done")
+    Simulator.move(game, player, game.usefulCases.getValue(CUSTOMER_BELL))
+    debug("move2 done")
+    */
+    while (player.items.size != items.size) {
+        Simulator.collectSimpleItem(game, player, items)
+        game.debug()
+    }
+
+    //Simulator.move(game, player, game.usefulCases.getValue(CUSTOMER_BELL))
+    //debug("move3 done")
+}
+
+
+/**
+ *
+ *
+ * GAME SIMULATOR
+ *
+ *
+ */
+object Simulator {
+    data class Player(var position: Point = Point(0, 0), val items: MutableList<Item> = mutableListOf())
+    data class Game(
+        val map: List<List<Case>>,
+        val player: Player = Player(),
+        var partner: Player = Player(),
+        var waitingCustomers: List<Customer> = listOf(),
+        private var tables: List<Table> = listOf(),
+        var tableItemsAvailables: Map<Item, List<Table>> = hashMapOf(),
+        val usefulCases: Map<CaseType, Case> = (CaseType.values().toList() - EMPTY).associate { it to findCase(map.flatten(), it) },
+        var ovenContent: Item? = null,
+        var ovenTimer: Int = 0
+    ) {
+        companion object {
+            private fun findCase(casesFlatten: List<Case>, caseType: CaseType) = casesFlatten.first { it.type == caseType }
+        }
+
+        fun get(x: Int, y: Int) = map[y][x]
+        fun get(point: Point) = get(point.x, point.y)
+        fun getEmptyTable(player: Player) = (-1..1).flatMap { y -> (-1..1).map { x -> this.get(player.position.x + x, player.position.y + y) } }
+            .filter { it.type == WORK_TABLE }
+            .firstOrNull { case -> tables.none { it.case.position == case.position } }
+
+
+        val dishwasher get() = usefulCases.getValue(DISHWASHER)
+        val blueberriesCrate get() = usefulCases.getValue(BLUEBERRIES_CRATE)
+        val strawberriesCrate get() = usefulCases.getValue(STRAWBERRIES_CRATE)
+        val doughCrate get() = usefulCases.getValue(DOUGH_CRATE)
+        val choppingBoard get() = usefulCases.getValue(CHOPPING_BOARD)
+        val iceCreamer get() = usefulCases.getValue(ICE_CREAMER)
+        val oven get() = usefulCases.getValue(OVEN)
+        val customerBell get() = usefulCases.getValue(CUSTOMER_BELL)
+
+
+        fun debug() {
+            map.forEach {
+                it.forEach {
+                    if (it.position == player.position)
+                        System.err.print('0')
+                    else if (it.position == partner.position)
+                        System.err.print('1')
+                    else
+                        System.err.print(it.type.caseChar)
+                }
+                System.err.println()
+            }
+        }
+    }
+
+    private fun Player.isAdjacent(case: Case) = this.position.isAdjacent(case.position)
+
+    fun move(game: Game, player: Player, case: Case, aggressiveMode: Boolean = true) {
+        val path = PathFinder.findPath(game, player, case.position) ?: error("cannot find a path from $player to $case")
+        //path.forEach { debug("step: ${it.position}") }
+        if (path.isEmpty()) {
+            error("take care, this move was unnecessary")
+        } else {
+            val index = if (path.size > 4) 3 else path.lastIndex
+
+            if ((0..index).any { path[it].position == game.partner.position } && aggressiveMode) {
+                player.position = game.partner.position
+            } else {
+                player.position = path[index].position
+            }
+        }
+    }
+
+    fun collectItem(game: Game, player: Player, customer1: Customer, customer2: Customer, currentCases: List<Case> = listOf()): List<Case> {
+        val itemsToTake = customer1.recipe.filter { !player.items.contains(it) }
+        val authorizedProviders = itemsToTake.filter { it.preparation == null }.map { game.usefulCases.getValue(it.caseProvider!!) }
+        val preparedItemsCases = itemsToTake.filter { it.preparation != null }.flatMap {
+            val tables = game.tableItemsAvailables[it]
+            if (tables != null && tables.isNotEmpty()) {
+                tables.map { it.case }
+            } else {
+                listOf(game.usefulCases[StartPoint.getStart(it).caseProvider]!!)
+            }
+        }
+
+        if(player.haveAllItems(game, customer1)) {
+            return currentCases
+        } else {
+            (authorizedProviders + preparedItemsCases).map {  }
+        }
+    }
+
+
+    private fun Player.haveAllItems(game: Game, customer: Customer): Boolean {
+        return customer.recipe.all { this.items.contains(it) }
+    }
+
+
+    fun collectSimpleItem(game: Game, player: Player, items: List<Item>) {
+        val remainingItems = if (player.items.size <= 1)
+            items.filter { !player.items.contains(it) }
+        else
+            listOf(DISH)
+
+        val adjacentItem = remainingItems.find { player.isAdjacent(game.usefulCases.getValue(it.caseProvider!!)) }
+
+        if (adjacentItem != null) { //Take item
+            player.items.add(adjacentItem)
+        } else { //Move to item provider
+            val paths = remainingItems.map {
+                val case = game.usefulCases.getValue(it.caseProvider!!)
+                case to PathFinder.findPath(game, player, case.position)
+            }
+            val caseWithPath = paths.minBy { it.second?.size ?: error("man...") }!!
+            move(game, player, caseWithPath.first)
+        }
+    }
+
+    fun deliverDish(game: Game, player: Player, customer: Customer) {
+        if (player.items.containsAll(customer.recipe)) {
+            move(game, player, game.customerBell)
+        } else {
+            error("The dish is not ready, ${customer.recipe.filter { !player.items.contains(it) }}")
+        }
+    }
+
+
+    //fun trySolution(game: Game, player: Player, items: Item)
+
+
+    /**
+     *
+     *
+     * PATH FINDER
+     *
+     *
+     */
+    object PathFinder {
+        private data class Node(val case: Case, val cost: Int, val estimatedCost: Int, val previousNode: Node?)
+
+        private fun getAdjacentCases(map: Game, case: Case): List<Case> {
+            val position = case.position
+            return listOf(map.get(position.left), map.get(position.right), map.get(position.down), map.get(position.up)).filter { it.type == EMPTY }
+        }
+
+        private fun getAdjacentNodes(map: Game, end: Point, openList: MutableList<Node>, closedList: MutableList<Node>, node: Node): MutableList<Node> {
+            return getAdjacentCases(map, node.case)
+                .filter { case -> openList.find { node -> node.case == case } == null }
+                .filter { case -> closedList.find { node -> node.case == case } == null }
+                .map { Node(it, node.cost + 1, it.position.distanceTo(end), node) }
+                .toMutableList()
+        }
+
+        private fun extractPath(latestNode: Node): List<Case> {
+            val path: MutableList<Case> = mutableListOf()
+            var currentNode: Node = latestNode
+            while (currentNode.previousNode != null) {
+                path.add(currentNode.case)
+                currentNode = currentNode.previousNode!!
+            }
+            return path
+        }
+
+        fun findPath(map: Game, start: Player, end: Player): List<Case>? = findPath(map, start.position, end.position)
+        fun findPath(map: Game, start: Player, end: Point): List<Case>? = findPath(map, start.position, end)
+
+        fun findPath(map: Game, start: Point, end: Point): List<Case>? {
+            //if (start == end) return listOf()
+            if (Math.abs(start.x - end.x) <= 1 && Math.abs(start.y - end.y) <= 1) return listOf() //TODO check that
+
+            val closedList = mutableListOf<Node>()
+            val firstNodes = getAdjacentNodes(map, end, mutableListOf(), closedList, Node(map.get(start), 0, start.distanceTo(end), null))
+
+            return findPath(map, end, firstNodes, mutableListOf())?.reversed()
+        }
+
+        private fun findPath(map: Game, end: Point, openList: MutableList<Node>, closedList: MutableList<Node>): List<Case>? {
+            var bestNode: Node? = null
+
+            //while (bestNode?.estimatedCost != 0 && !openList.isEmpty()) {
+            while (bestNode?.case?.position?.isAdjacent(end) != true && !openList.isEmpty()) {
+                bestNode = openList.sortedBy { it.cost + it.estimatedCost }.firstOrNull()
+                if (bestNode == null) {
+                    return null
+                }
+                openList.remove(bestNode)
+                closedList.add(bestNode)
+                openList.addAll(getAdjacentNodes(map, end, openList, closedList, bestNode))
+            }
+
+            if (bestNode == null)
+                return null
+            else
+                return extractPath(bestNode)
+        }
+
+
+        fun realDistanceTo(map: Game, start: Player, end: Player) = realDistanceTo(map, start.position, end.position)
+
+        fun realDistanceTo(map: Game, start: Point, end: Point): Int {
+            if (start == end) return 0
+
+            val closedList = mutableListOf<Node>()
+            val firstNodes = getAdjacentNodes(map, end, mutableListOf(), closedList, Node(map.get(start), 0, start.distanceTo(end), null))
+
+            return realDistanceTo(map, end, firstNodes, mutableListOf())
+        }
+
+        private fun realDistanceTo(map: Game, end: Point, openList: MutableList<Node>, closedList: MutableList<Node>): Int {
+            var bestNode: Node? = null
+
+            while (bestNode?.estimatedCost != 0 && !openList.isEmpty()) {
+                bestNode = openList.sortedBy { it.cost + it.estimatedCost }.firstOrNull()
+                if (bestNode == null) {
+                    return Int.MAX_VALUE
+                }
+                openList.remove(bestNode)
+                closedList.add(bestNode)
+                openList.addAll(getAdjacentNodes(map, end, openList, closedList, bestNode))
+            }
+
+            if (bestNode == null)
+                return Int.MAX_VALUE
+            else
+                return bestNode.cost
+        }
+    }
+}
+
